@@ -36,8 +36,11 @@ fun main() {
     val stateFilePath = System.getenv("STATE_FILE") ?: "state-$nodeId.json"
     val stateFile = File(stateFilePath)
 
-    val raftNode = RaftNode(nodeId = nodeId, peers = peers, stateFile = stateFile)
-
+    val raftNode = RaftNode(
+        nodeId = nodeId,
+        initialPeers = peers,
+        stateFile = stateFile
+    )
     val grpcServer = ServerBuilder
         .forPort(grpcPort)
         .addService(RaftGrpcService(raftNode))

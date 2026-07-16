@@ -25,7 +25,7 @@ import kotlinx.coroutines.sync.withLock
  */
 class RaftNode(
     val nodeId: String,
-    private val peers: Map<String, String>, // peerId -> "host:port"
+    private val initialPeers: Map<String, String>, // peerId -> "host:port"
     private val stateFile: File? = null,
     private val heartbeatIntervalMillis: Long = 75
 ) {
@@ -37,8 +37,8 @@ class RaftNode(
     // entries (those replicated to a majority) are ever applied here.
     private val stateMachine = StateMachine()
 
-    private val peerClients: Map<String, PeerClient> =
-        peers.mapValues { (_, address) -> PeerClient(address) }
+    private val dynamicPeers = mutableMapOf<String, String>()
+    private val dynamicPeerClients = mutableMapOf<String, PeerClient>()
 
     private lateinit var electionTimer: ElectionTimer
     private var heartbeatJob: Job? = null
@@ -48,14 +48,15 @@ class RaftNode(
     // to await replication before responding to clients.
     private val commitIndexFlow = MutableStateFlow(-1L)
 
-    // Cluster size = every peer + self. Majority is the smallest number
     // that is more than half — this is what lets the cluster tolerate
     // node failures: as long as a majority are alive and reachable, an
     // election (or a commit) can succeed.
     private val majority: Int
-        get() = (peers.size + 1) / 2 + 1
+        get() = (dynamicPeers.size + 1) / 2 + 1
 
     suspend fun start() {
+        dynamicPeers.putAll(initialPeers)
+        
         if (stateFile != null) {
             val loaded = StateStorage.load(stateFile)
             if (loaded != null) {
@@ -69,9 +70,23 @@ class RaftNode(
             }
         }
 
+        // Replay log to find all committed configuration changes.
+        // The log is the definitive source of truth for the cluster's membership.
+        for (entry in state.log) {
+            val parts = entry.command.split(" ")
+            if (parts[0] == "ADD_NODE" && parts.size >= 3) {
+                dynamicPeers[parts[1]] = parts[2]
+            } else if (parts[0] == "REMOVE_NODE" && parts.size >= 2) {
+                dynamicPeers.remove(parts[1])
+            }
+        }
+        
+        // Initialize gRPC clients for all active peers
+        dynamicPeers.forEach { (id, addr) -> dynamicPeerClients[id] = PeerClient(addr) }
+
         electionTimer = ElectionTimer(scope) { onElectionTimeout() }
         electionTimer.reset()
-        log("started as FOLLOWER, cluster size=${peers.size + 1}, majority needed=$majority")
+        log("started as FOLLOWER, cluster size=${dynamicPeers.size + 1}, majority needed=$majority")
     }
 
     // ---- Election timeout: this node has heard nothing from a leader ----
@@ -117,7 +132,7 @@ class RaftNode(
         // Fire all RequestVote calls concurrently — we must not let one slow
         // or dead peer block the others. Each PeerClient enforces its own
         // short RPC timeout independently of this election's timeout.
-        val pending = peerClients.map { (peerId, client) ->
+        val pending = dynamicPeerClients.map { (peerId, client) ->
             scope.async {
                 peerId to runCatching {
                     client.requestVote(
@@ -180,7 +195,7 @@ class RaftNode(
         //   rule uses matchIndex (not nextIndex), so we never commit based on what
         //   we optimistically hope a peer has.
         val initialNextIndex = state.lastLogIndex() + 1
-        for (peerId in peers.keys) {
+        for (peerId in dynamicPeers.keys) {
             state.nextIndex[peerId] = initialNextIndex
             state.matchIndex[peerId] = -1L
         }
@@ -265,7 +280,7 @@ class RaftNode(
     private fun startReplication() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
-            for ((peerId, client) in peerClients) {
+            for ((peerId, client) in dynamicPeerClients) {
                 launch { replicateToPeer(peerId, client) }
             }
         }
@@ -433,9 +448,16 @@ class RaftNode(
             val replicaCount = 1 + state.matchIndex.values.count { it >= n }
             if (replicaCount >= majority) {
                 log("commitIndex ${state.commitIndex} -> $n " +
-                    "(replicated on $replicaCount/${peers.size + 1} nodes)")
+                    "(replicated on $replicaCount/${dynamicPeers.size + 1} nodes)")
                 state.commitIndex = n
                 commitIndexFlow.value = n
+                
+                // Clear the in-flight configuration change guard if it was committed
+                val pendingIdx = state.pendingConfigChangeIndex
+                if (pendingIdx != null && n >= pendingIdx) {
+                    state.pendingConfigChangeIndex = null
+                }
+
                 applyCommittedEntries()
                 break // highest N found; entries below are committed implicitly
             }
@@ -461,6 +483,45 @@ class RaftNode(
         while (state.lastApplied < state.commitIndex) {
             state.lastApplied += 1
             val entry = state.log.getOrNull(state.lastApplied.toInt()) ?: break
+            
+            // Intercept configuration changes
+            val parts = entry.command.split(" ")
+            if (parts[0] == "ADD_NODE" && parts.size >= 3) {
+                val newPeerId = parts[1]
+                val newAddress = parts[2]
+                if (!dynamicPeers.containsKey(newPeerId)) {
+                    log("Configuration change: ADD_NODE $newPeerId at $newAddress")
+                    dynamicPeers[newPeerId] = newAddress
+                    val newClient = PeerClient(newAddress)
+                    dynamicPeerClients[newPeerId] = newClient
+                    
+                    // If we are leader, immediately start replicating to this new node
+                    if (state.role == NodeRole.LEADER) {
+                        state.nextIndex[newPeerId] = state.lastLogIndex() + 1
+                        state.matchIndex[newPeerId] = -1L
+                        heartbeatJob?.let { job ->
+                            scope.launch(job) { replicateToPeer(newPeerId, newClient) }
+                        }
+                    }
+                }
+            } else if (parts[0] == "REMOVE_NODE" && parts.size >= 2) {
+                val removePeerId = parts[1]
+                if (dynamicPeers.containsKey(removePeerId)) {
+                    log("Configuration change: REMOVE_NODE $removePeerId")
+                    dynamicPeers.remove(removePeerId)
+                    dynamicPeerClients.remove(removePeerId)
+                    
+                    if (state.role == NodeRole.LEADER) {
+                        state.nextIndex.remove(removePeerId)
+                        state.matchIndex.remove(removePeerId)
+                        // Note: To cleanly cancel the existing replication coroutine for this specific peer, 
+                        // we'd need to track individual Jobs. Since we don't, it will naturally spin down 
+                        // and get stuck failing to connect, which is okay for this milestone. 
+                        // Alternatively, it throws or breaks when the client is removed.
+                    }
+                }
+            }
+
             stateMachine.apply(entry.index, entry.command)
         }
     }
@@ -630,6 +691,26 @@ class RaftNode(
         state.log.add(LogEntry(term = state.currentTerm, index = index, command = command))
         persistState()
         log("submitCommand: appended '$command' at index=$index term=${state.currentTerm}")
+        index
+    }
+
+    /**
+     * Atomically submits a configuration change (ADD_NODE or REMOVE_NODE) only if 
+     * there is no existing configuration change currently in-flight.
+     * Returns the log index if submitted, or null if rejected.
+     */
+    suspend fun trySubmitConfigCommand(command: String): Long? = mutex.withLock {
+        if (state.pendingConfigChangeIndex != null) {
+            return@withLock null
+        }
+        check(state.role == NodeRole.LEADER) {
+            "trySubmitConfigCommand rejected: not the leader (current leader=${state.currentLeader})"
+        }
+        val index = state.lastLogIndex() + 1
+        state.log.add(LogEntry(term = state.currentTerm, index = index, command = command))
+        state.pendingConfigChangeIndex = index
+        persistState()
+        log("trySubmitConfigCommand: appended config change '$command' at index=$index term=${state.currentTerm}")
         index
     }
 

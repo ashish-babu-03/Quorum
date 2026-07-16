@@ -95,6 +95,16 @@ class StateMachine {
                 println("[StateMachine] index=$index EXPIRE_LOCK success: $resourceId forcibly expired")
                 CommandResult.Success("Lock expired successfully")
             }
+            "ADD_NODE" -> {
+                val nodeId = parts.getOrNull(1) ?: return logUnknown(index, command)
+                println("[StateMachine] index=$index ADD_NODE success: $nodeId added to cluster")
+                CommandResult.Success("Node added successfully")
+            }
+            "REMOVE_NODE" -> {
+                val nodeId = parts.getOrNull(1) ?: return logUnknown(index, command)
+                println("[StateMachine] index=$index REMOVE_NODE success: $nodeId removed from cluster")
+                CommandResult.Success("Node removed successfully")
+            }
             "NOOP" -> {
                 println("[StateMachine] index=$index NOOP (leader commit sentinel)")
                 CommandResult.Success("NOOP applied")

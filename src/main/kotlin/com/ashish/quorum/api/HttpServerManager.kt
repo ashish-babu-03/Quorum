@@ -25,6 +25,7 @@ class HttpServerManager(
     fun start() {
         server = HttpServer.create(InetSocketAddress(port), 0).apply {
             createContext("/locks/", ::handleLocks)
+            createContext("/cluster/", ::handleLocks)
             executor = null // Creates a default executor
             start()
         }
@@ -50,6 +51,12 @@ class HttpServerManager(
     private suspend fun processRequest(exchange: HttpExchange) {
         val path = exchange.requestURI.path // e.g., /locks/my-resource/acquire
         val method = exchange.requestMethod
+
+        if (path.startsWith("/cluster/")) {
+            val action = path.removePrefix("/cluster/")
+            handleCluster(exchange, action)
+            return
+        }
 
         val parts = path.removePrefix("/locks/").split("/")
         if (parts.size < 2) {
@@ -202,6 +209,75 @@ class HttpServerManager(
             sendResponse(exchange, 404, "{\"status\": \"free\"}")
         } else {
             sendResponse(exchange, 200, "{\"status\": \"locked\", \"clientId\": \"${lock.clientId}\", \"expiresAt\": ${lock.expiresAt}}")
+        }
+    }
+
+    private suspend fun handleCluster(exchange: HttpExchange, action: String) {
+        if (exchange.requestMethod != "POST") {
+            sendResponse(exchange, 405, "{\"error\": \"Method not allowed\"}")
+            return
+        }
+        
+        val (role, currentLeader) = raftNode.getLeadershipInfo()
+        if (role != NodeRole.LEADER) {
+            if (currentLeader == null) {
+                sendResponse(exchange, 503, "{\"error\": \"Cluster has no leader currently. Retry later.\"}")
+                return
+            }
+            val redirectUrl = "http://$currentLeader:$port${exchange.requestURI.path}"
+            exchange.responseHeaders.set("Location", redirectUrl)
+            exchange.sendResponseHeaders(307, -1)
+            exchange.close()
+            return
+        }
+
+        val requestBody = String(exchange.requestBody.readAllBytes(), StandardCharsets.UTF_8)
+        val parsedJson = parseFlatJson(requestBody)
+        val nodeId = parsedJson["nodeId"]
+        
+        if (nodeId == null) {
+            sendResponse(exchange, 400, "{\"error\": \"Missing nodeId\"}")
+            return
+        }
+
+        when (action) {
+            "add" -> {
+                val address = parsedJson["address"]
+                if (address == null) {
+                    sendResponse(exchange, 400, "{\"error\": \"Missing address\"}")
+                    return
+                }
+                
+                val logIndex = raftNode.trySubmitConfigCommand("ADD_NODE $nodeId $address")
+                if (logIndex == null) {
+                    sendResponse(exchange, 409, "{\"error\": \"A configuration change is already in progress, try again once it completes.\"}")
+                    return
+                }
+                
+                val committed = raftNode.awaitCommit(logIndex, timeoutMs = 5000)
+                if (!committed) {
+                    sendResponse(exchange, 503, "{\"error\": \"Timed out waiting for consensus.\"}")
+                    return
+                }
+                sendResponse(exchange, 200, "{\"status\": \"added\", \"nodeId\": \"$nodeId\"}")
+            }
+            "remove" -> {
+                val logIndex = raftNode.trySubmitConfigCommand("REMOVE_NODE $nodeId")
+                if (logIndex == null) {
+                    sendResponse(exchange, 409, "{\"error\": \"A configuration change is already in progress, try again once it completes.\"}")
+                    return
+                }
+                
+                val committed = raftNode.awaitCommit(logIndex, timeoutMs = 5000)
+                if (!committed) {
+                    sendResponse(exchange, 503, "{\"error\": \"Timed out waiting for consensus.\"}")
+                    return
+                }
+                sendResponse(exchange, 200, "{\"status\": \"removed\", \"nodeId\": \"$nodeId\"}")
+            }
+            else -> {
+                sendResponse(exchange, 404, "{\"error\": \"Unknown cluster action: $action\"}")
+            }
         }
     }
 

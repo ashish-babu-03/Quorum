@@ -47,10 +47,48 @@ services:
     networks:
       - raftnet
 
+  node-4:
+    build: .
+    container_name: node-4
+    environment:
+      NODE_ID: node-4
+      GRPC_PORT: "9090"
+      PEERS: "node-1@node-1:9090,node-2@node-2:9090,node-3@node-3:9090"
+      STATE_FILE: "/data/state-node-4.json"
+    ports:
+      - "9094:9090"
+      - "10094:10090"
+    volumes:
+      - node4-data:/data
+    networks:
+      - raftnet
+    profiles:
+      - dynamic
+
+  node-5:
+    build: .
+    container_name: node-5
+    environment:
+      NODE_ID: node-5
+      GRPC_PORT: "9090"
+      PEERS: "node-1@node-1:9090,node-2@node-2:9090,node-3@node-3:9090"
+      STATE_FILE: "/data/state-node-5.json"
+    ports:
+      - "9095:9090"
+      - "10095:10090"
+    volumes:
+      - node5-data:/data
+    networks:
+      - raftnet
+    profiles:
+      - dynamic
+
 volumes:
   node1-data:
   node2-data:
   node3-data:
+  node4-data:
+  node5-data:
 
 networks:
   raftnet:

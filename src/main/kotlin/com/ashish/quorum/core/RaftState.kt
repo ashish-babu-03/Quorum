@@ -37,6 +37,13 @@ class RaftState {
     // a time in order, catching up from lastApplied+1 to commitIndex.
     var lastApplied: Long = -1
 
+    // Tracks the log index of an uncommitted configuration change (ADD_NODE or REMOVE_NODE).
+    // The Raft paper (§6) requires that only ONE configuration change can be in-flight
+    // at a time. If two overlapping membership changes are allowed simultaneously,
+    // they could create two different valid majorities at the exact same time, breaking
+    // the system's core safety guarantee (a split-brain where two leaders can be elected).
+    var pendingConfigChangeIndex: Long? = null
+
     // ---- Volatile leader state — re-initialized on EVERY becomeLeader() ----
     // These are NOT persistent: if the leader crashes, it rediscovers peer
     // progress by probing with AppendEntries on the next term.
