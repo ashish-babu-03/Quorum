@@ -1,0 +1,40 @@
+services:
+  node-1:
+    build: .
+    container_name: node-1
+    environment:
+      NODE_ID: node-1
+      GRPC_PORT: "9090"
+      PEERS: "node-2@node-2:9090,node-3@node-3:9090"
+    ports:
+      - "9091:9090"
+    networks:
+      - raftnet
+
+  node-2:
+    build: .
+    container_name: node-2
+    environment:
+      NODE_ID: node-2
+      GRPC_PORT: "9090"
+      PEERS: "node-1@node-1:9090,node-3@node-3:9090"
+    ports:
+      - "9092:9090"
+    networks:
+      - raftnet
+
+  node-3:
+    build: .
+    container_name: node-3
+    environment:
+      NODE_ID: node-3
+      GRPC_PORT: "9090"
+      PEERS: "node-1@node-1:9090,node-2@node-2:9090"
+    ports:
+      - "9093:9090"
+    networks:
+      - raftnet
+
+networks:
+  raftnet:
+    driver: bridge
