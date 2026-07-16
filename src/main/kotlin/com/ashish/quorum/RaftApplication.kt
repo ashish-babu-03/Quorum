@@ -1,7 +1,7 @@
-package com.ashish.raftlock
+package com.ashish.quorum
 
-import com.ashish.raftlock.core.RaftNode
-import com.ashish.raftlock.rpc.RaftGrpcService
+import com.ashish.quorum.core.RaftNode
+import com.ashish.quorum.rpc.RaftGrpcService
 import io.grpc.ServerBuilder
 import kotlinx.coroutines.runBlocking
 

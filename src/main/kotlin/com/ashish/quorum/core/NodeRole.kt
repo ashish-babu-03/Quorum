@@ -1,4 +1,4 @@
-package com.ashish.raftlock.core
+package com.ashish.quorum.core
 
 /**
  * Every node is in exactly one of these states at any moment.

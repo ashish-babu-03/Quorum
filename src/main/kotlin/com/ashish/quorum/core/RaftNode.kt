@@ -1,6 +1,6 @@
-package com.ashish.raftlock.core
+package com.ashish.quorum.core
 
-import com.ashish.raftlock.rpc.PeerClient
+import com.ashish.quorum.rpc.PeerClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job

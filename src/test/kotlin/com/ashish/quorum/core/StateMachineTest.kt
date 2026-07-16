@@ -1,4 +1,4 @@
-package com.ashish.raftlock.core
+package com.ashish.quorum.core
 
 import kotlin.test.Test
 import kotlin.test.assertEquals

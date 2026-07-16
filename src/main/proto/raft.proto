@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package raft;
 
-option java_package = "com.ashish.raftlock.grpc";
+option java_package = "com.ashish.quorum.grpc";
 option java_multiple_files = true;
 option java_outer_classname = "RaftProto";
 

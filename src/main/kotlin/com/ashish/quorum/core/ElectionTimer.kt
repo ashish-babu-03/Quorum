@@ -1,4 +1,4 @@
-package com.ashish.raftlock.core
+package com.ashish.quorum.core
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job

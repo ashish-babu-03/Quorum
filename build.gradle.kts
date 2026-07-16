@@ -61,7 +61,7 @@ protobuf {
 }
 
 application {
-    mainClass.set("com.ashish.raftlock.RaftApplicationKt")
+    mainClass.set("com.ashish.quorum.RaftApplicationKt")
 }
 
 tasks.withType<KotlinCompile> {

@@ -1,12 +1,12 @@
-package com.ashish.raftlock.rpc
+package com.ashish.quorum.rpc
 
-import com.ashish.raftlock.core.LogEntry
-import com.ashish.raftlock.core.RaftNode
-import com.ashish.raftlock.grpc.AppendEntriesRequest
-import com.ashish.raftlock.grpc.AppendEntriesResponse
-import com.ashish.raftlock.grpc.RaftServiceGrpcKt
-import com.ashish.raftlock.grpc.VoteRequest
-import com.ashish.raftlock.grpc.VoteResponse
+import com.ashish.quorum.core.LogEntry
+import com.ashish.quorum.core.RaftNode
+import com.ashish.quorum.grpc.AppendEntriesRequest
+import com.ashish.quorum.grpc.AppendEntriesResponse
+import com.ashish.quorum.grpc.RaftServiceGrpcKt
+import com.ashish.quorum.grpc.VoteRequest
+import com.ashish.quorum.grpc.VoteResponse
 
 /**
  * Server-side gRPC endpoint. Deliberately thin — all real decision-making

@@ -1,6 +1,6 @@
-# raft-lock-manager
+# Quorum
 
-A distributed lock manager built on a self-implemented Raft-style consensus
+Quorum — a distributed lock manager built on a self-implemented Raft-style consensus
 core (leader election + heartbeat-based liveness). Multiple nodes coordinate
 over gRPC to agree on cluster leadership without any external coordinator —
 if the leader dies, a new one is elected automatically within a few hundred

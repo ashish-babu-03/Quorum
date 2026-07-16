@@ -1,1 +1,1 @@
-rootProject.name = "raft-lock-manager"
+rootProject.name = "quorum"

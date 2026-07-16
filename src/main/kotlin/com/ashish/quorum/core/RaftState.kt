@@ -1,4 +1,4 @@
-package com.ashish.raftlock.core
+package com.ashish.quorum.core
 
 data class LogEntry(
     val term: Long,

@@ -1,4 +1,4 @@
-package com.ashish.raftlock.core
+package com.ashish.quorum.core
 
 /**
  * Simple in-memory key-value store that serves as the state machine for the
