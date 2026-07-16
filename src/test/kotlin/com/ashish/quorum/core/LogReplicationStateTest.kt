@@ -185,9 +185,9 @@ class LogReplicationStateTest {
     fun `lastApplied is always less than or equal to commitIndex after sequential application`() {
         // Simulate applyCommittedEntries: drive lastApplied from -1 to commitIndex
         val log = mutableListOf(
-            LogEntry(term = 1, index = 0, command = "SET a 1"),
-            LogEntry(term = 1, index = 1, command = "SET b 2"),
-            LogEntry(term = 1, index = 2, command = "SET c 3")
+            LogEntry(term = 1, index = 0, command = "ACQUIRE_LOCK a client-1 t1 5000000000000 0"),
+            LogEntry(term = 1, index = 1, command = "ACQUIRE_LOCK b client-1 t2 5000000000000 0"),
+            LogEntry(term = 1, index = 2, command = "ACQUIRE_LOCK c client-1 t3 5000000000000 0")
         )
         var lastApplied = -1L
         val commitIndex = 2L
@@ -200,8 +200,8 @@ class LogReplicationStateTest {
         }
 
         assertEquals(commitIndex, lastApplied)
-        assertEquals("1", sm.get("a"))
-        assertEquals("2", sm.get("b"))
-        assertEquals("3", sm.get("c"))
+        assertEquals("client-1", sm.getLock("a")?.clientId)
+        assertEquals("client-1", sm.getLock("b")?.clientId)
+        assertEquals("client-1", sm.getLock("c")?.clientId)
     }
 }

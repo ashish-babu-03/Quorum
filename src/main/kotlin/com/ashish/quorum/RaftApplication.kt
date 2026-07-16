@@ -2,7 +2,10 @@ package com.ashish.quorum
 
 import com.ashish.quorum.core.RaftNode
 import com.ashish.quorum.rpc.RaftGrpcService
+import com.ashish.quorum.api.HttpServerManager
 import io.grpc.ServerBuilder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -39,6 +42,11 @@ fun main() {
     grpcServer.start()
     println("[$nodeId] gRPC server listening on port $grpcPort, peers=$peers")
 
+    val httpPort = grpcPort + 1000
+    val apiScope = CoroutineScope(Dispatchers.Default)
+    val httpServer = HttpServerManager(raftNode, httpPort, apiScope)
+    httpServer.start()
+
     runBlocking {
         raftNode.start()
     }
@@ -46,6 +54,7 @@ fun main() {
     Runtime.getRuntime().addShutdownHook(
         Thread {
             println("[$nodeId] shutting down")
+            httpServer.stop()
             grpcServer.shutdownNow()
         }
     )

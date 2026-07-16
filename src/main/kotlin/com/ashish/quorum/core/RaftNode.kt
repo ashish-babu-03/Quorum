@@ -1,5 +1,6 @@
 package com.ashish.quorum.core
 
+import com.ashish.quorum.core.CommandResult
 import com.ashish.quorum.rpc.PeerClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -9,6 +10,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -36,7 +40,10 @@ class RaftNode(
 
     private lateinit var electionTimer: ElectionTimer
     private var heartbeatJob: Job? = null
-    private var dummyJob: Job? = null
+
+    // Emits every time commitIndex advances. The HTTP API layer collects this
+    // to await replication before responding to clients.
+    private val commitIndexFlow = MutableStateFlow(-1L)
 
     // Cluster size = every peer + self. Majority is the smallest number
     // that is more than half — this is what lets the cluster tolerate
@@ -176,27 +183,9 @@ class RaftNode(
 
         log("WON election for term $termForThisElection -> became LEADER, appended NOOP at index=$noopIndex")
         startReplication()
-        startDummyCommandLoop()
     }
 
     // ---- Per-peer replication loops ----
-
-    private fun startDummyCommandLoop() {
-        dummyJob?.cancel()
-        dummyJob = scope.launch {
-            var count = 1
-            while (true) {
-                delay(3000)
-                try {
-                    // Temporarily added for Milestone 2 visibility
-                    // TODO: Remove this once Milestone 3 adds real HTTP client API
-                    submitCommand("test-command-${count++}")
-                } catch (e: Exception) {
-                    // expected if we step down mid-loop
-                }
-            }
-        }
-    }
 
     // One dedicated coroutine per peer, replacing the old single shared heartbeat.
     //
@@ -383,6 +372,7 @@ class RaftNode(
                 log("commitIndex ${state.commitIndex} -> $n " +
                     "(replicated on $replicaCount/${peers.size + 1} nodes)")
                 state.commitIndex = n
+                commitIndexFlow.value = n
                 applyCommittedEntries()
                 break // highest N found; entries below are committed implicitly
             }
@@ -532,6 +522,7 @@ class RaftNode(
         //   - Once committed, we apply those entries to the state machine in order.
         if (leaderCommit > state.commitIndex) {
             state.commitIndex = minOf(leaderCommit, state.lastLogIndex())
+            commitIndexFlow.value = state.commitIndex
             applyCommittedEntries()
         }
 
@@ -568,18 +559,52 @@ class RaftNode(
     }
 
     /**
-     * Returns true if the entry at [logIndex] has been committed (replicated to
-     * a majority). Applied to the state machine immediately after commit.
+     * Awaits until the entry at [logIndex] has been committed (replicated to
+     * a majority). Returns true if committed within [timeoutMs], false otherwise.
+     *
+     * WHY StateFlow instead of delay() polling?
+     * Polling wastes CPU and introduces artificial latency equal to the poll interval.
+     * StateFlow suspends perfectly until the exact moment commitIndexFlow emits a
+     * value >= our target, letting us respond to the HTTP client instantly.
      */
-    suspend fun isCommitted(logIndex: Long): Boolean = mutex.withLock {
-        state.commitIndex >= logIndex
+    suspend fun awaitCommit(logIndex: Long, timeoutMs: Long = 2000): Boolean {
+        val result = withTimeoutOrNull(timeoutMs) {
+            commitIndexFlow.first { it >= logIndex }
+        }
+        return result != null
+    }
+
+    /**
+     * Thread-safe accessor for leadership info.
+     *
+     * WHY not let the HTTP handler read state.role directly?
+     * The RaftState is mutable and protected by a Mutex. Reading it without the
+     * Mutex introduces race conditions where we might read a partially updated state
+     * (e.g. role is LEADER but currentLeader is still null from a previous stepDown).
+     */
+    suspend fun getLeadershipInfo(): Pair<NodeRole, String?> = mutex.withLock {
+        state.role to state.currentLeader
+    }
+
+    /**
+     * Safely reads a lock record from the state machine.
+     */
+    suspend fun getLock(resourceId: String): LockRecord? = mutex.withLock {
+        stateMachine.getLock(resourceId)
+    }
+
+    /**
+     * Safely reads the result of a committed and applied command.
+     */
+    suspend fun getCommandResult(index: Long): CommandResult? = mutex.withLock {
+        stateMachine.getCommandResult(index)
     }
 
     /**
      * Returns a point-in-time snapshot of the state machine contents.
      * Useful for testing and for Milestone 3's read endpoints.
      */
-    suspend fun getStateMachineSnapshot(): Map<String, String> = mutex.withLock {
+    suspend fun getStateMachineSnapshot(): Map<String, LockRecord> = mutex.withLock {
         stateMachine.snapshot()
     }
 
@@ -592,7 +617,6 @@ class RaftNode(
         if (wasLeader) {
             // Cancels all per-peer replication coroutines via structured concurrency.
             heartbeatJob?.cancel()
-            dummyJob?.cancel()
             log("stepping down from LEADER — saw higher term $newTerm")
         }
         electionTimer.reset()

@@ -1,72 +1,126 @@
 package com.ashish.quorum.core
 
+data class LockRecord(
+    val resourceId: String,
+    val clientId: String,
+    val lockToken: String,
+    val expiresAt: Long
+)
+
+sealed class CommandResult {
+    data class Success(val message: String) : CommandResult()
+    data class Failure(val reason: String) : CommandResult()
+}
+
 /**
- * Simple in-memory key-value store that serves as the state machine for the
- * Raft cluster. Milestone 3's lock API (ACQUIRE/RELEASE) will sit on top of this.
- *
- * WHY is this separate from RaftState?
- * RaftState is the CONSENSUS layer (term, log, votes). StateMachine is the
- * APPLICATION layer (the result of applying all committed operations in order).
- * Keeping them separate means:
- *   1. If you add log compaction (snapshotting) later, you snapshot the state
- *      machine independently from the Raft log — the snapshot IS the state
- *      machine at a given log index.
- *   2. The state machine never sees uncommitted entries — only entries that
- *      have already been confirmed by a majority are applied here.
- *
- * NOT thread-safe on its own. All calls must be made while holding RaftNode's
- * mutex — which is already true since applyCommittedEntries() holds the lock.
+ * The application layer State Machine for Quorum.
+ * Stores lock records and processes deterministic commands from the Raft log.
  */
 class StateMachine {
-    private val store: MutableMap<String, String> = mutableMapOf()
+    private val locks = mutableMapOf<String, LockRecord>()
+    private val commandResults = mutableMapOf<Long, CommandResult>()
 
     /**
-     * Apply one committed log entry to the state machine.
-     *
-     * Supported command formats:
-     *   "SET <key> <value>"   — sets store[key] = value
-     *   "DELETE <key>"        — removes key from store
-     *   "NOOP"                — no-op (used by new leaders to commit prior entries
-     *                          indirectly; has no effect on stored state)
-     *
-     * WHY must apply() never throw?
-     * If an exception propagated out of apply(), the caller (applyCommittedEntries)
-     * would leave lastApplied and commitIndex in an inconsistent state — fewer
-     * entries applied than committed. On a follower this would mean the state
-     * machine falls behind permanently. Unknown/malformed commands are logged and
-     * skipped instead, which is safe: a skipped command is idempotent on replay.
+     * Applies a committed command.
+     * 
+     * WHY does the command include a 'requestTimestamp'?
+     * State machine application MUST be deterministic. If a follower crashes and
+     * replays its log an hour later, it must reconstruct the exact same state. 
+     * If apply() called System.currentTimeMillis() to check if a lock had expired,
+     * an ACQUIRE that failed originally might succeed during replay. By encoding 
+     * the leader's timestamp in the command, replay behavior is perfectly identical 
+     * across all nodes and all times.
      */
-    fun apply(index: Long, command: String) {
-        val parts = command.trim().split(" ", limit = 3)
-        when (parts.getOrNull(0)?.uppercase()) {
-            "SET" -> {
-                val key = parts.getOrNull(1) ?: return logUnknown(index, command)
-                val value = parts.getOrNull(2) ?: return logUnknown(index, command)
-                store[key] = value
-                println("[StateMachine] index=$index SET $key=$value")
+    fun apply(index: Long, command: String): CommandResult {
+        val parts = command.trim().split(" ")
+        val result: CommandResult = when (parts.getOrNull(0)?.uppercase()) {
+            "ACQUIRE_LOCK" -> {
+                // Format: ACQUIRE_LOCK <resourceId> <clientId> <lockToken> <expiresAt> <requestTimestamp>
+                val resourceId = parts.getOrNull(1) ?: return logUnknown(index, command)
+                val clientId = parts.getOrNull(2) ?: return logUnknown(index, command)
+                val lockToken = parts.getOrNull(3) ?: return logUnknown(index, command)
+                val expiresAt = parts.getOrNull(4)?.toLongOrNull() ?: return logUnknown(index, command)
+                val requestTimestamp = parts.getOrNull(5)?.toLongOrNull() ?: return logUnknown(index, command)
+                
+                val current = locks[resourceId]
+                
+                // We can acquire if it's completely free, OR if the existing lock had expired 
+                // BEFORE this request was made (as determined by the leader's requestTimestamp).
+                if (current == null || current.expiresAt <= requestTimestamp) {
+                    locks[resourceId] = LockRecord(resourceId, clientId, lockToken, expiresAt)
+                    println("[StateMachine] index=$index ACQUIRE_LOCK success: $resourceId by $clientId")
+                    CommandResult.Success("Lock acquired successfully")
+                } else {
+                    println("[StateMachine] index=$index ACQUIRE_LOCK failed (already held): $resourceId")
+                    CommandResult.Failure("Conflict. Lock already held by someone else.")
+                }
             }
-            "DELETE" -> {
-                val key = parts.getOrNull(1) ?: return logUnknown(index, command)
-                store.remove(key)
-                println("[StateMachine] index=$index DELETE $key")
+            "RELEASE_LOCK" -> {
+                // Format: RELEASE_LOCK <resourceId> <clientId> <lockToken>
+                val resourceId = parts.getOrNull(1) ?: return logUnknown(index, command)
+                val clientId = parts.getOrNull(2) ?: return logUnknown(index, command)
+                val lockToken = parts.getOrNull(3) ?: return logUnknown(index, command)
+                
+                val current = locks[resourceId]
+                if (current != null && current.clientId == clientId && current.lockToken == lockToken) {
+                    locks.remove(resourceId)
+                    println("[StateMachine] index=$index RELEASE_LOCK success: $resourceId")
+                    CommandResult.Success("Lock released successfully")
+                } else {
+                    println("[StateMachine] index=$index RELEASE_LOCK failed (mismatch or not held): $resourceId")
+                    CommandResult.Failure("Failed to release. Token mismatch or lock belongs to someone else.")
+                }
+            }
+            "RENEW_LOCK" -> {
+                // Format: RENEW_LOCK <resourceId> <clientId> <lockToken> <expiresAt>
+                val resourceId = parts.getOrNull(1) ?: return logUnknown(index, command)
+                val clientId = parts.getOrNull(2) ?: return logUnknown(index, command)
+                val lockToken = parts.getOrNull(3) ?: return logUnknown(index, command)
+                val expiresAt = parts.getOrNull(4)?.toLongOrNull() ?: return logUnknown(index, command)
+                
+                val current = locks[resourceId]
+                if (current != null && current.clientId == clientId && current.lockToken == lockToken) {
+                    locks[resourceId] = current.copy(expiresAt = expiresAt)
+                    println("[StateMachine] index=$index RENEW_LOCK success: $resourceId extended to $expiresAt")
+                    CommandResult.Success("Lock renewed successfully")
+                } else {
+                    println("[StateMachine] index=$index RENEW_LOCK failed (mismatch or not held): $resourceId")
+                    CommandResult.Failure("Failed to renew. Lock not held or token mismatch.")
+                }
             }
             "NOOP" -> {
-                // Leader no-op: commits prior entries indirectly, no state change.
                 println("[StateMachine] index=$index NOOP (leader commit sentinel)")
+                CommandResult.Success("NOOP applied")
             }
             else -> logUnknown(index, command)
         }
+        commandResults[index] = result
+        return result
     }
 
-    fun get(key: String): String? = store[key]
+    /**
+     * Retrieves the definitive result of a command previously applied at [index].
+     */
+    fun getCommandResult(index: Long): CommandResult? = commandResults[index]
 
     /**
-     * Returns a point-in-time copy of the entire store. Safe to return outside
-     * the mutex because the copy is immutable once taken.
+     * Reads the current lock state. 
+     * NOTE: We still check local System.currentTimeMillis() here for READS because 
+     * this is not mutating state. If a client queries status and the lock is expired 
+     * according to the local clock, we report it as expired.
      */
-    fun snapshot(): Map<String, String> = store.toMap()
+    fun getLock(resourceId: String): LockRecord? {
+        val lock = locks[resourceId]
+        if (lock != null && lock.expiresAt > System.currentTimeMillis()) {
+            return lock
+        }
+        return null // return null if it's physically gone or logically expired
+    }
 
-    private fun logUnknown(index: Long, command: String) {
+    fun snapshot(): Map<String, LockRecord> = locks.toMap()
+
+    private fun logUnknown(index: Long, command: String): CommandResult.Failure {
         println("[StateMachine] WARNING: unknown command at index=$index: '$command' — skipped")
+        return CommandResult.Failure("Unknown or malformed command")
     }
 }
