@@ -5,6 +5,7 @@ import com.ashish.quorum.rpc.PeerClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import java.io.File
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -25,6 +26,7 @@ import kotlinx.coroutines.sync.withLock
 class RaftNode(
     val nodeId: String,
     private val peers: Map<String, String>, // peerId -> "host:port"
+    private val stateFile: File? = null,
     private val heartbeatIntervalMillis: Long = 75
 ) {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -40,6 +42,7 @@ class RaftNode(
 
     private lateinit var electionTimer: ElectionTimer
     private var heartbeatJob: Job? = null
+    private var leaseSweepJob: Job? = null
 
     // Emits every time commitIndex advances. The HTTP API layer collects this
     // to await replication before responding to clients.
@@ -53,12 +56,31 @@ class RaftNode(
         get() = (peers.size + 1) / 2 + 1
 
     suspend fun start() {
+        if (stateFile != null) {
+            val loaded = StateStorage.load(stateFile)
+            if (loaded != null) {
+                mutex.withLock {
+                    state.currentTerm = loaded.first
+                    state.votedFor = loaded.second
+                    state.log.clear()
+                    state.log.addAll(loaded.third)
+                }
+                log("loaded state from disk: term=${loaded.first}, logSize=${loaded.third.size}")
+            }
+        }
+
         electionTimer = ElectionTimer(scope) { onElectionTimeout() }
         electionTimer.reset()
         log("started as FOLLOWER, cluster size=${peers.size + 1}, majority needed=$majority")
     }
 
     // ---- Election timeout: this node has heard nothing from a leader ----
+
+    private fun persistState() {
+        if (stateFile != null) {
+            StateStorage.save(stateFile, state.currentTerm, state.votedFor, state.log)
+        }
+    }
 
     private suspend fun onElectionTimeout() {
         val termForThisElection: Long
@@ -76,6 +98,7 @@ class RaftNode(
             // (e.g. a split vote), we need a fresh randomized timeout so we
             // (or someone else) tries again rather than hanging forever.
             electionTimer.reset()
+            persistState()
         }
 
         runElection(termForThisElection)
@@ -180,12 +203,52 @@ class RaftNode(
         // so the very first replication round will send it to all followers.
         val noopIndex = state.lastLogIndex() + 1
         state.log.add(LogEntry(term = termForThisElection, index = noopIndex, command = "NOOP"))
+        persistState()
 
         log("WON election for term $termForThisElection -> became LEADER, appended NOOP at index=$noopIndex")
         startReplication()
+        startLeaseSweepLoop()
     }
 
     // ---- Per-peer replication loops ----
+
+    // WHY sweep-and-replicate instead of independent local deletion?
+    // If every node independently deleted expired locks via a local timer, clock skew
+    // and network partitions could cause them to disagree on precisely WHEN a lock expired.
+    // A partitioned node might delete a lock locally while the leader still considers it valid.
+    // By having ONLY the leader run the timer, and having it submit an explicit
+    // EXPIRE_LOCK command through the Raft log, all nodes apply the exact same deletion
+    // at the exact same logical index in the log, preserving perfect state machine replication.
+    private fun startLeaseSweepLoop() {
+        leaseSweepJob?.cancel()
+        leaseSweepJob = scope.launch {
+            while (true) {
+                delay(5000)
+                try {
+                    val now = System.currentTimeMillis()
+                    // Snapshot the state securely inside the mutex
+                    val snapshot = mutex.withLock {
+                        if (state.role != NodeRole.LEADER) return@launch
+                        stateMachine.snapshot()
+                    }
+
+                    for ((resourceId, lockRecord) in snapshot) {
+                        if (lockRecord.expiresAt <= now) {
+                            // Submit deletion through consensus. 
+                            // Using runCatching because submitCommand throws if we lost leadership
+                            // between the snapshot and now.
+                            runCatching {
+                                submitCommand("EXPIRE_LOCK $resourceId")
+                                log("Submitted EXPIRE_LOCK for $resourceId")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Ignore expected cancellation exceptions if we step down mid-loop
+                }
+            }
+        }
+    }
 
     // One dedicated coroutine per peer, replacing the old single shared heartbeat.
     //
@@ -432,6 +495,14 @@ class RaftNode(
         } else {
             log("rejected vote for $candidateId: alreadyVotedFor=${state.votedFor}, logUpToDate=$candidateLogIsAtLeastAsUpToDate")
         }
+
+        // WHY persist-before-respond ordering is a safety requirement:
+        // If a node grants a vote but crashes BEFORE saving that vote to disk, 
+        // it could restart and vote again for a different candidate in the exact same term.
+        // This violates the "one vote per term" rule and could lead to two leaders in the same term.
+        // The same applies to appending log entries: acknowledging an append but losing it
+        // on crash breaks the log-matching invariant and could lead to committed entries being lost.
+        persistState()
         state.currentTerm to grant
     }
 
@@ -477,6 +548,7 @@ class RaftNode(
             if (entryAtPrev == null || entryAtPrev.term != prevLogTerm) {
                 log("rejected AppendEntries from $leaderId: mismatch at prevLogIndex=$prevLogIndex " +
                     "(expected term=$prevLogTerm, have=${entryAtPrev?.term ?: "nothing"})")
+                persistState()
                 return@withLock state.currentTerm to false
             }
         }
@@ -526,6 +598,8 @@ class RaftNode(
             applyCommittedEntries()
         }
 
+        // Persist before responding to AppendEntries to ensure safety (same reason as RequestVote).
+        persistState()
         state.currentTerm to true
     }
 
@@ -554,6 +628,7 @@ class RaftNode(
         }
         val index = state.lastLogIndex() + 1
         state.log.add(LogEntry(term = state.currentTerm, index = index, command = command))
+        persistState()
         log("submitCommand: appended '$command' at index=$index term=${state.currentTerm}")
         index
     }
@@ -614,9 +689,11 @@ class RaftNode(
         state.currentTerm = newTerm
         state.role = NodeRole.FOLLOWER
         state.votedFor = null
+        persistState()
         if (wasLeader) {
             // Cancels all per-peer replication coroutines via structured concurrency.
             heartbeatJob?.cancel()
+            leaseSweepJob?.cancel()
             log("stepping down from LEADER — saw higher term $newTerm")
         }
         electionTimer.reset()

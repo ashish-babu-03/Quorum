@@ -6,9 +6,12 @@ services:
       NODE_ID: node-1
       GRPC_PORT: "9090"
       PEERS: "node-2@node-2:9090,node-3@node-3:9090"
+      STATE_FILE: "/data/state-node-1.json"
     ports:
       - "9091:9090"
       - "10091:10090"
+    volumes:
+      - node1-data:/data
     networks:
       - raftnet
 
@@ -19,9 +22,12 @@ services:
       NODE_ID: node-2
       GRPC_PORT: "9090"
       PEERS: "node-1@node-1:9090,node-3@node-3:9090"
+      STATE_FILE: "/data/state-node-2.json"
     ports:
       - "9092:9090"
       - "10092:10090"
+    volumes:
+      - node2-data:/data
     networks:
       - raftnet
 
@@ -32,11 +38,19 @@ services:
       NODE_ID: node-3
       GRPC_PORT: "9090"
       PEERS: "node-1@node-1:9090,node-2@node-2:9090"
+      STATE_FILE: "/data/state-node-3.json"
     ports:
       - "9093:9090"
       - "10093:10090"
+    volumes:
+      - node3-data:/data
     networks:
       - raftnet
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
 
 networks:
   raftnet:

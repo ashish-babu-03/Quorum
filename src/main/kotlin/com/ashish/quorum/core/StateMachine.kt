@@ -88,6 +88,13 @@ class StateMachine {
                     CommandResult.Failure("Failed to renew. Lock not held or token mismatch.")
                 }
             }
+            "EXPIRE_LOCK" -> {
+                // Format: EXPIRE_LOCK <resourceId>
+                val resourceId = parts.getOrNull(1) ?: return logUnknown(index, command)
+                locks.remove(resourceId)
+                println("[StateMachine] index=$index EXPIRE_LOCK success: $resourceId forcibly expired")
+                CommandResult.Success("Lock expired successfully")
+            }
             "NOOP" -> {
                 println("[StateMachine] index=$index NOOP (leader commit sentinel)")
                 CommandResult.Success("NOOP applied")

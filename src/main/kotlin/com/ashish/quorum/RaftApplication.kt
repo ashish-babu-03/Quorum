@@ -7,6 +7,7 @@ import io.grpc.ServerBuilder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import java.io.File
 
 /**
  * Boots one Raft node.
@@ -32,7 +33,10 @@ fun main() {
             id to address
         }
 
-    val raftNode = RaftNode(nodeId = nodeId, peers = peers)
+    val stateFilePath = System.getenv("STATE_FILE") ?: "state-$nodeId.json"
+    val stateFile = File(stateFilePath)
+
+    val raftNode = RaftNode(nodeId = nodeId, peers = peers, stateFile = stateFile)
 
     val grpcServer = ServerBuilder
         .forPort(grpcPort)
